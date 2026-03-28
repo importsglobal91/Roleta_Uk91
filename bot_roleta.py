@@ -2,33 +2,71 @@ import os
 import asyncio
 import random
 from datetime import datetime
-from typing import Dict, List
-from dataclasses import dataclass
+from typing import Dict, List, Optional
+from dataclasses import dataclass, field
+
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
-# Carrega TOKEN do .env (crie arquivo .env com TOKEN=seu_token)
-TOKEN = os.getenv('TOKEN', '8657281596:AAE-wBWQnJgHctXEKn4lbD1XsEJCDfByNLA')
+# TOKEN do bot (pode vir do .env)
+TOKEN = os.getenv("TOKEN", "8657281596:AAE-wBWQnJgHctXEKn4lbD1XsEJCDfByNLA ")
+
+# ---------------- MODELOS DE ESTADO ----------------
 
 @dataclass
 class EstadoRoleta:
     nome: str
-    ultimo: str = None
-    contagem: int = 0
-    greens: int = 0
-    hora_inicio: str = None
+    historico: List[int] = field(default_factory=list)      # últimos números
+    hora_inicio: Optional[str] = None
     rodadas: int = 0
-    historico: List[int] = None  # Novo: histórico para 9V/9P
+
+    # estado da sequência de repetição
+    padrao_atual: Optional[str] = None       # "PAR", "IMPAR", "VERMELHO", "PRETO", "ALTO", "BAIXO"
+    em_analise: bool = False                # já mandamos mensagem ANALISANDO
+    entrada_em_andamento: bool = False      # já estamos nas tentativas (11ª em diante)
+    tentativas_restantes: int = 0           # 3 → 1ª, 2ª, 3ª entrada
+
+    # estatísticas por mesa
+    greens: int = 0
+    reds: int = 0
+    greens_seguidos: int = 0
+
+
+@dataclass
+class EstatisticasGlobais:
+    greens: int = 0
+    reds: int = 0
+    greens_seguidos: int = 0
+
+    def registrar_green(self):
+        self.greens += 1
+        self.greens_seguidos += 1
+
+    def registrar_red(self):
+        self.reds += 1
+        self.greens_seguidos = 0
+
+    @property
+    def total(self) -> int:
+        return self.greens + self.reds
+
+    @property
+    def porcentagem(self) -> float:
+        return (self.greens / self.total * 100) if self.total > 0 else 0.0
+
+
+# ---------------- BOT MULTI ROLETAS ----------------
 
 class BotMultiRoleta:
     def __init__(self):
         self.roletas: Dict[str, EstadoRoleta] = {}
         self.ativo = False
-        self.context = None
-        self.chat_id = None
-        self.loop_tasks = []
+        self.context: Optional[ContextTypes.DEFAULT_TYPE] = None
+        self.chat_id: Optional[int] = None
+        self.loop_tasks: List[asyncio.Task] = []
+        self.estatisticas = EstatisticasGlobais()
 
-        # Mesas 32Red reais (incluindo Red Door Roulette)
+        # Mesas 32Red
         self.roletas_nomes = [
             "Roleta 32Vermelha",
             "Lightning Roulette",
@@ -47,7 +85,7 @@ class BotMultiRoleta:
             "Red Door Roulette",
         ]
 
-        # Links diretos das mesas (ajuste se algum nome/link for diferente no site)
+        # Links diretos das mesas
         self.links_mesas = {
             "Roleta 32Vermelha": "https://www.32red.com/play/32red-roulette#playforreal",
             "Lightning Roulette": "https://www.32red.com/play/lightning-roulette#playforreal",
@@ -64,10 +102,210 @@ class BotMultiRoleta:
             "Double Ball Roulette": "https://www.32red.com/play/double-ball-roulette#playforreal",
             "Crazy Time Roulette": "https://www.32red.com/play/crazy-time#playforreal",
             "Red Door Roulette": "https://www.32red.com/play/red-door-roulette#playforreal",
+
         }
 
         for nome in self.roletas_nomes:
-            self.roletas[nome] = EstadoRoleta(nome=nome, historico=[])
+            self.roletas[nome] = EstadoRoleta(nome=nome)
+
+    # ----------- SIMULAÇÃO (trocar depois por números reais) -----------
+
+    async def gerar_numero_real(self, nome_roleta: str) -> int:
+        # Futuro: integrar Selenium / API da 32Red
+        return random.randint(0, 36)
+
+    # ----------- CLASSIFICAÇÃO DOS NÚMEROS -----------
+
+    def classificar_padrao(self, numero: int) -> Dict[str, str]:
+        if numero == 0:
+            return {"paridade": "ZERO", "cor": "ZERO", "faixa": "ZERO"}
+
+        paridade = "PAR" if numero % 2 == 0 else "IMPAR"
+        vermelhos = {1,3,5,7,9,12,14,16,18,19,21,23,25,27,30,32,34,36}
+        cor = "VERMELHO" if numero in vermelhos else "PRETO"
+        faixa = "BAIXO" if 1 <= numero <= 18 else "ALTO"
+
+        return {"paridade": paridade, "cor": cor, "faixa": faixa}
+
+    # ----------- LÓGICA DA ESTRATÉGIA -----------
+
+    def determinar_padrao(self, ultimos: List[int]) -> Optional[str]:
+        """Vê se os 10 últimos seguem um mesmo padrão em paridade/cor/faixa."""
+        if len(ultimos) < 10:
+            return None
+
+        infos = [self.classificar_padrao(n) for n in ultimos[-10:]]
+        # ignora zeros
+        if any(info["paridade"] == "ZERO" for info in infos):
+            return None
+
+        # checa repetição em paridade
+        if all(info["paridade"] == infos[0]["paridade"] for info in infos):
+            return infos[0]["paridade"]  # "PAR" ou "IMPAR"
+
+        # repetição em cor
+        if all(info["cor"] == infos[0]["cor"] for info in infos):
+            return infos[0]["cor"]  # "VERMELHO" ou "PRETO"
+
+        # repetição em faixa
+        if all(info["faixa"] == infos[0]["faixa"] for info in infos):
+            return infos[0]["faixa"]  # "ALTO" ou "BAIXO"
+
+        return None
+
+    def contrario_do_padrao(self, padrao: str) -> str:
+        mapa = {
+            "PAR": "IMPAR",
+            "IMPAR": "PAR",
+            "VERMELHO": "PRETO",
+            "PRETO": "VERMELHO",
+            "ALTO": "BAIXO",
+            "BAIXO": "ALTO",
+        }
+        return mapa.get(padrao, "DESCONHECIDO")
+
+    async def enviar_mensagem(self, texto: str):
+        if self.context and self.chat_id:
+            await self.context.bot.send_message(
+                chat_id=self.chat_id,
+                text=texto,
+                parse_mode="Markdown",
+                disable_web_page_preview=True,  # não precisa preview do link
+            )
+
+    async def enviar_analise(self, r: EstadoRoleta, padrao: str):
+        """Mensagem enviada apenas quando entra em análise (depois de 10 números)."""
+        seq = " | ".join(str(n) for n in r.historico[-10:])
+        link = self.links_mesas.get(
+            r.nome, "https://www.32red.com/casino/live-casino/"
+        )
+
+        msg = (
+            "🚨 *ANALISANDO* 🚨\n\n"
+            f"🎯 Estratégia: Repetição de *{padrao.title()}*\n"
+            f"🎰 Mesa: [32Red — {r.nome}]({link})\n"
+            f"🔗 Link direto: {link}\n"
+            f"🚦 Sequência: {seq}\n"
+            "💰 Entrar ao contrário na 11ª jogada\n"
+            "💵 Cobrir o zero\n"
+            "♻️ Fazer até 3 entradas\n"
+        )
+        await self.enviar_mensagem(msg)
+
+    async def enviar_entrada_confirmada(
+        self, r: EstadoRoleta, padrao: str, numero: int, tentativa: int
+    ):
+        alvo = self.contrario_do_padrao(padrao)
+        link = self.links_mesas.get(
+            r.nome, "https://www.32red.com/casino/live-casino/"
+        )
+        msg = (
+            "✅ *ENTRADA CONFIRMADA* ✅\n\n"
+            f"🎯 Estratégia: Repetição de *{padrao.title()}*\n"
+            f"🎰 Mesa: [32Red — {r.nome}]({link})\n"
+            f"🔗 Link direto: {link}\n"
+            f"🎲 Último número: {numero}\n"
+            f"🎯 Entrar em: *{alvo}* (tentativa {tentativa}/3)\n"
+            "💵 Cobrir o zero\n"
+        )
+        await self.enviar_mensagem(msg)
+
+    async def enviar_resultado(self, green: bool):
+        if green:
+            self.estatisticas.registrar_green()
+        else:
+            self.estatisticas.registrar_red()
+
+        msg = (
+            f"📈 *Placar do dia* 🟢 {self.estatisticas.greens} 🔴 {self.estatisticas.reds}\n"
+            f"🎯 Acertamos {self.estatisticas.porcentagem:.2f}% das vezes\n"
+            f"🟢 Estamos com {self.estatisticas.greens_seguidos} Greens seguidos!\n"
+        )
+        await self.enviar_mensagem(msg)
+
+    async def processar_numero(self, nome_roleta: str, numero: int):
+        r = self.roletas[nome_roleta]
+        r.historico.append(numero)
+        if len(r.historico) > 40:
+            r.historico.pop(0)
+        r.rodadas += 1
+
+        info = self.classificar_padrao(numero)
+        print(
+            f"[{nome_roleta[:15]}] Nº:{numero} "
+            f"({info['paridade']},{info['cor']},{info['faixa']}) "
+            f"Rod:{r.rodadas}"
+        )
+
+        # Já estamos em uma sequência observada?
+        if not r.entrada_em_andamento:
+            padrao = self.determinar_padrao(r.historico)
+            if padrao:
+                # Entrou condição dos 10 últimos: manda APENAS ANALISANDO
+                if not r.em_analise:
+                    r.padrao_atual = padrao
+                    r.em_analise = True
+                    r.tentativas_restantes = 3
+                    await self.enviar_analise(r, padrao)
+                else:
+                    # Já está em análise; na próxima (11ª em diante) começa entrada
+                    if len(r.historico) >= 11 and not r.entrada_em_andamento:
+                        r.entrada_em_andamento = True
+                        await self.enviar_entrada_confirmada(
+                            r, r.padrao_atual, numero, 1
+                        )
+            else:
+                r.padrao_atual = None
+                r.em_analise = False
+        else:
+            # já estamos nas tentativas
+            alvo = self.contrario_do_padrao(r.padrao_atual)
+            ganhou = False
+
+            if alvo in {"PAR", "IMPAR"}:
+                ganhou = info["paridade"] == alvo
+            elif alvo in {"VERMELHO", "PRETO"}:
+                ganhou = info["cor"] == alvo
+            elif alvo in {"ALTO", "BAIXO"}:
+                ganhou = info["faixa"] == alvo
+
+            if ganhou:
+                r.greens += 1
+                r.greens_seguidos += 1
+                print(f"[{nome_roleta[:15]}] GREEN!")
+                await self.enviar_mensagem("✅✅✅ *GREEN!!!*")
+                await self.enviar_resultado(True)
+                r.padrao_atual = None
+                r.em_analise = False
+                r.entrada_em_andamento = False
+                r.tentativas_restantes = 0
+            else:
+                r.tentativas_restantes -= 1
+                if r.tentativas_restantes > 0:
+                    tentativa_feita = 4 - r.tentativas_restantes
+                    await self.enviar_entrada_confirmada(
+                        r, r.padrao_atual, numero, tentativa_feita
+                    )
+                else:
+                    r.reds += 1
+                    r.greens_seguidos = 0
+                    print(f"[{nome_roleta[:15]}] RED!")
+                    await self.enviar_mensagem("❌ *RED nessa sequência*")
+                    await self.enviar_resultado(False)
+                    r.padrao_atual = None
+                    r.em_analise = False
+                    r.entrada_em_andamento = False
+
+    async def loop_analise_roleta(self, nome_roleta: str):
+        print(f"[▶] Monitorando: {nome_roleta}")
+        while self.ativo:
+            try:
+                numero = await self.gerar_numero_real(nome_roleta)
+                await self.processar_numero(nome_roleta, numero)
+                await asyncio.sleep(2)  # mais rápido para simulação
+            except Exception as e:
+                print(f"[✗] Erro {nome_roleta}: {e}")
+                await asyncio.sleep(10)
 
     async def iniciar_monitoramento(self) -> bool:
         print("[LOG] Iniciando monitoramento multi-roleta 32Red...")
@@ -78,121 +316,32 @@ class BotMultiRoleta:
         print(f"[✓] Monitorando {len(self.roletas)} roletas")
         return True
 
-    async def gerar_numero_real(self, nome_roleta: str) -> int:
-        """Futuro: Selenium scraper 32Red (integrado)"""
-        # SIMULAÇÃO - substitua por selenium real
-        return random.randint(0, 36)
-
-    async def analisar_padrao(self, historico: List[int]) -> str:
-        """Análise avançada: 9V/9P, Repetição, Street"""
-        if len(historico) < 9:
-            return "Aguardando padrão..."
-
-        vermelhos = {1,3,5,7,9,12,14,16,18,19,21,23,25,27,30,32,34,36}
-        ultimos9 = historico[-9:]
-        v_count = sum(1 for n in ultimos9 if n in vermelhos)
-        p_count = 9 - v_count
-
-        if v_count == 9:
-            return "🔴 9 VERMELHO - PRETO!"
-        if p_count == 9:
-            return "⚫ 9 PRETO - VERMELHO!"
-        if len(set(ultimos9[-3:])) == 1:
-            return "🔁 REPETIÇÃO 3x!"
-        if ultimos9[-1] in {1,4,7,10,13,16,19,22,25,28,31,34}:
-            return "🛣️ STREET 1-25!"
-        return "Aguardando..."
-
-    async def loop_analise_roleta(self, nome_roleta: str):
-        print(f"[▶] Monitorando: {nome_roleta}")
-        while self.ativo:
-            try:
-                numero = await self.gerar_numero_real(nome_roleta)
-                await self.processar_numero(nome_roleta, numero)
-                await asyncio.sleep(25)  # 25s por mesa
-            except Exception as e:
-                print(f"[✗] Erro {nome_roleta}: {e}")
-                await asyncio.sleep(10)
-
-    async def processar_numero(self, nome_roleta: str, numero: int):
-        roleta = self.roletas[nome_roleta]
-        numero_str = str(numero)
-        roleta.historico.append(numero)
-        if len(roleta.historico) > 20:  # Mantém 20 últimos
-            roleta.historico.pop(0)
-
-        if roleta.ultimo != numero_str:
-            roleta.contagem = 1
-            roleta.ultimo = numero_str
-        else:
-            roleta.contagem += 1
-        roleta.rodadas += 1
-
-        print(f"[{nome_roleta[:15]}] Nº:{numero} Seq:{roleta.contagem}x Rod:{roleta.rodadas}")
-
-        # SINAIS múltiplos
-        sinal = await self.analisar_padrao(roleta.historico)
-        if "9 " in sinal or "REPETIÇÃO" in sinal or roleta.contagem >= 10:
-            roleta.greens += 1
-
-            link = self.links_mesas.get(
-                nome_roleta,
-                "https://www.32red.com/casino/live-casino/"
-            )
-
-            msg_sinal = (
-                f"🟢 **SINAL {nome_roleta}!**\n"
-                f"📊 Nº: {numero}\n"
-                f"{sinal}\n"
-                f"🟢 Total: {roleta.greens}\n\n"
-                f"[🎰 Abrir mesa agora]({link})"
-            )
-            print(f"🟢 SINAL: {sinal}")
-            if self.context and self.chat_id:
-                await self.context.bot.send_message(
-                    chat_id=self.chat_id,
-                    text=msg_sinal,
-                    parse_mode="Markdown"
-                )
-
-        if roleta.contagem >= 10:
-            roleta.contagem = 0
-
-    async def enviar_sinal(self, mensagem: str):
-        try:
-            await self.context.bot.send_message(
-                chat_id=self.chat_id,
-                text=mensagem,
-                parse_mode="Markdown"
-            )
-            print("[✓] Sinal Telegram OK")
-        except Exception as e:
-            print(f"[✗] Telegram: {e}")
-
     def parar(self):
         self.ativo = False
         print("[⏹] Bot parado")
 
-# Instância global
+
 botauto = BotMultiRoleta()
 
-# Comandos Telegram
+# ---------------- COMANDOS TELEGRAM ----------------
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     botauto.chat_id = update.effective_chat.id
     botauto.context = context
     msg = (
-        "🎰 **Bot 32Red v5.0 COMPLETO**\n\n"
-        "/iniciar - mesas 24/7\n"
-        "/status - Todas roletas\n"
-        "/roletas - Lista mesas\n"
-        "/parar - Stop\n\n"
-        "✅ Pronto!"
+        "🎰 *Bot 32Red v5.0 COMPLETO*\n\n"
+        "/iniciar - Ligar monitoramento\n"
+        "/status  - Ver roletas\n"
+        "/roletas - Listar mesas\n"
+        "/parar   - Stop\n\n"
+        "✅ Pronto para analisar 10 giros e entrar na 11ª com 3 tentativas."
     )
     await update.message.reply_text(msg, parse_mode="Markdown")
 
+
 async def iniciar(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if botauto.ativo:
-        return await update.message.reply_text("❌ Já ativo!")
+        return await update.message.reply_text("❌ Já está ativo.")
     await update.message.reply_text("⏳ Iniciando mesas...")
     sucesso = await botauto.iniciar_monitoramento()
     if sucesso:
@@ -200,36 +349,50 @@ async def iniciar(update: Update, context: ContextTypes.DEFAULT_TYPE):
             task = asyncio.create_task(botauto.loop_analise_roleta(nome))
             botauto.loop_tasks.append(task)
         await update.message.reply_text(
-            "✅ **BOT LIGADO!** mesas ativas\nUse /status",
-            parse_mode="Markdown"
+            "✅ *BOT LIGADO!* Mesas ativas.\nUse /status para ver.",
+            parse_mode="Markdown",
         )
+
 
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not botauto.ativo:
-        return await update.message.reply_text("❌ Desligado. /iniciar")
-    msg = "📊 **STATUS ROLETAS**\n\n"
-    for nome, r in list(botauto.roletas.items())[:8]:  # Top 8 pra caber
-        msg += f"🎰 {nome[:20]}: Seq {r.contagem}x | 🟢 {r.greens}\n"
+        return await update.message.reply_text("❌ Desligado. Use /iniciar.")
+    msg = "📊 *STATUS ROLETAS (top 8)*\n\n"
+    for nome, r in list(botauto.roletas.items())[:8]:
+        msg += (
+            f"🎰 {nome[:20]}: "
+            f"Rod {r.rodadas} | 🟢 {r.greens} 🔴 {r.reds} | "
+            f"Seq greens: {r.greens_seguidos}\n"
+        )
     await update.message.reply_text(msg, parse_mode="Markdown")
 
+
 async def roletas(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = "🎯 **Mesas 32Red**\n" + "\n".join(
+    msg = "🎯 *Mesas 32Red*\n" + "\n".join(
         f"{i+1}. {nome}" for i, nome in enumerate(botauto.roletas_nomes)
     )
     await update.message.reply_text(msg, parse_mode="Markdown")
 
+
 async def parar(update: Update, context: ContextTypes.DEFAULT_TYPE):
     botauto.parar()
-    total = sum(r.greens for r in botauto.roletas.values())
-    await update.message.reply_text(
-        f"⏹️ Parado | 🟢 Total sinais: {total}",
-        parse_mode="Markdown"
+    total = botauto.estatisticas.total
+    msg = (
+        f"⏹️ Bot parado.\n"
+        f"🟢 Greens: {botauto.estatisticas.greens} "
+        f"🔴 Reds: {botauto.estatisticas.reds}\n"
+        f"🎯 Acerto: {botauto.estatisticas.porcentagem:.2f}% (total {total})"
     )
+    await update.message.reply_text(msg, parse_mode="Markdown")
+
 
 def main():
     print("=" * 60)
     print("🎰 BOT 32RED v5.0 - COMPLETO")
-    print(f"Roletas: {len(botauto.roletas)} | TOKEN: {'OK' if TOKEN else 'FALTA .env'}")
+    print(
+        f"Roletas: {len(botauto.roletas)} | TOKEN: "
+        f"{'OK' if TOKEN and TOKEN != 'SEU_TOKEN_AQUI' else 'FALTA .env/TOKEN'}"
+    )
     print("=" * 60)
 
     app = ApplicationBuilder().token(TOKEN).build()
@@ -238,8 +401,10 @@ def main():
     app.add_handler(CommandHandler("status", status))
     app.add_handler(CommandHandler("roletas", roletas))
     app.add_handler(CommandHandler("parar", parar))
+
     print("[▶] Bot online...")
     app.run_polling()
+
 
 if __name__ == "__main__":
     main()
