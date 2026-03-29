@@ -391,7 +391,7 @@ def main():
     print("🎰 BOT 32RED v5.0 - COMPLETO")
     print(
         f"Roletas: {len(botauto.roletas)} | TOKEN: "
-        f"{'OK' if TOKEN and TOKEN != 'SEU_TOKEN_AQUI' else 'FALTA .env/TOKEN'}"
+        f"{'OK' if TOKEN and TOKEN != '8657281596:AAE-wBWQnJgHctXEKn4lbD1XsEJCDfByNLA else 'FALTA .env/TOKEN'}"
     )
     print("=" * 60)
 
