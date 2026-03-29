@@ -9,7 +9,7 @@ from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
 # TOKEN do bot
-TOKEN = os.getenv("8657281596:AAE-wBWQnJgHctXEKn4lbD1XsEJCDfByNLA")
+TOKEN = os.getenv("8657281596:AAExL5uCblF4v2AaA0lnYPEF0cPesXVqkRA")
 
 # NOME DA SUA SALA / CABEÇALHO DAS MENSAGENS
 NOME_SALA = "Roleta__"
@@ -205,7 +205,7 @@ class BotMultiRoleta:
             f"🚦 Sequência: {seq}\n\n"
             f"💰 Entrar após o {numero} apostar em {aposta}\n"
             f"👉 Cobrir o zero\n"
-            f"🔁 Fazer até 3 gales"
+            f"🔁 Fazer até 2 gales"
         )
         await self.enviar_mensagem(msg)
 
