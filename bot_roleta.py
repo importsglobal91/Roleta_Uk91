@@ -12,7 +12,7 @@ from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 TOKEN = os.getenv("8657281596:AAE-wBWQnJgHctXEKn4lbD1XsEJCDfByNLA")
 
 # NOME DA SUA SALA / CABEÇALHO DAS MENSAGENS
-NOME_SALA = "Roleta__UK"
+NOME_SALA = "Roleta__"
 
 
 # ---------------- MODELOS DE ESTADO ----------------
